@@ -1,0 +1,6 @@
+<resources>
+    <style name="Theme.VanishClassNetwork" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@drawable/vanish_splash_background</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+</resources>

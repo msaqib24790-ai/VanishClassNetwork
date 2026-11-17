@@ -1,0 +1,29 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Signing keys and private credentials
+*.jks
+*.keystore
+key.properties
+.env
+.env.*
+
+# Local IDE settings and temporary files
+.idea/
+student_identity_errors.txt
+
+# Team assignment protocol (keep local for now)
+/PROTOCOL.md

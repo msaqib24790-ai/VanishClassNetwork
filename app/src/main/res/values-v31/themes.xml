@@ -1,0 +1,9 @@
+<resources>
+    <style name="Theme.VanishClassNetwork" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowSplashScreenBackground">#FFFFFF</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/vanish_logo</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">#FFFFFF</item>
+        <item name="android:windowBackground">@drawable/vanish_splash_background</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+</resources>
