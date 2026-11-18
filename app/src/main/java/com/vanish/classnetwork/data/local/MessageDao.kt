@@ -40,8 +40,42 @@ interface MessageDao {
         currentTime: Long
     ): Flow<List<MessageEntity>>
 
+
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertMessage(message: MessageEntity): Long
+
+    // Retrieve an existing message to prevent duplicate insertion.
+    @Query(
+        """
+        SELECT * FROM messages
+        WHERE id = :messageId
+        AND classNetworkId = :classNetworkId
+        LIMIT 1
+        """
+    )
+    suspend fun getMessageById(
+        messageId: String,
+        classNetworkId: String
+    ): MessageEntity?
+
+    // Update message timestamps and status using relay confirmation.
+    @Query(
+        """
+        UPDATE messages
+        SET sentAt = :sentAt,
+            expiresAt = :expiresAt,
+            status = :status
+        WHERE id = :messageId
+        AND classNetworkId = :classNetworkId
+        """
+    )
+    suspend fun updateRelayMetadata(
+        messageId: String,
+        classNetworkId: String,
+        sentAt: Long,
+        expiresAt: Long,
+        status: String
+    ): Int
 
     @Query(
         """
@@ -91,6 +125,19 @@ interface MessageDao {
         """
     )
     suspend fun deleteMessage(
+        messageId: String,
+        classNetworkId: String
+    )
+
+    // Remove a message when the relay reports its expiration.
+    @Query(
+        """
+        DELETE FROM messages
+        WHERE id = :messageId
+        AND classNetworkId = :classNetworkId
+        """
+    )
+    suspend fun deleteExpiredRelayMessage(
         messageId: String,
         classNetworkId: String
     )

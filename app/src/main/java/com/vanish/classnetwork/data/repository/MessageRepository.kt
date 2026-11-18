@@ -106,15 +106,92 @@ class MessageRepository(
         }
     }
 
+
+    // Process a message received from the relay.
+    // Update an existing outgoing message instead of inserting a duplicate.
+    suspend fun saveRelayMessage(
+        messageId: String,
+        classNetworkId: String,
+        sender: String,
+        senderDeviceId: String,
+        text: String,
+        sentAt: Long,
+        expiresAt: Long
+    ): Boolean {
+        require(classNetworkId.isNotBlank())
+        require(messageId.isNotBlank())
+        require(text.isNotBlank() && text.length <= 500)
+        require(expiresAt > sentAt)
+
+        val existing = messageDao.getMessageById(
+            messageId,
+            classNetworkId
+        )
+
+        if (existing != null) {
+            if (existing.isOutgoing) {
+                messageDao.updateRelayMetadata(
+                    messageId = messageId,
+                    classNetworkId = classNetworkId,
+                    sentAt = sentAt,
+                    expiresAt = expiresAt,
+                    status = MessageStatus.SENT.name
+                )
+            }
+            return false
+        }
+
+        val relayMessage = MessageEntity(
+            id = messageId,
+            classNetworkId = classNetworkId,
+            sender = sender,
+            senderDeviceId = senderDeviceId,
+            text = text,
+            createdAt = sentAt,
+            sentAt = sentAt,
+            expiresAt = expiresAt,
+            status = MessageStatus.SENT,
+            isOutgoing = false
+        )
+
+        return messageDao.insertMessage(relayMessage) != -1L
+    }
+
+    // Mark a message as delivered after relay confirmation.
+    suspend fun markRelayMessageDelivered(
+        messageId: String,
+        classNetworkId: String,
+        serverTime: Long
+    ) {
+        messageDao.updateStatus(
+            messageId = messageId,
+            classNetworkId = classNetworkId,
+            newStatus = MessageStatus.DELIVERED.name,
+            currentTime = serverTime
+        )
+    }
+
+    // Delete a message when the relay reports expiration.
+    suspend fun removeRelayExpiredMessage(
+        messageId: String,
+        classNetworkId: String
+    ) {
+        messageDao.deleteExpiredRelayMessage(
+            messageId,
+            classNetworkId
+        )
+    }
+
     suspend fun updateMessageStatus(
         messageId: String,
         classNetworkId: String,
         status: MessageStatus
     ) {
-
-        require(status != MessageStatus.SENT &&
-                status != MessageStatus.DELIVERED &&
-                status != MessageStatus.DISPLAYED) {
+        require(
+            status != MessageStatus.SENT &&
+                    status != MessageStatus.DELIVERED &&
+                    status != MessageStatus.DISPLAYED
+        ) {
             "Delivery statuses require relay confirmation."
         }
 
@@ -127,7 +204,6 @@ class MessageRepository(
     }
 
     suspend fun cleanExpiredMessages(): Int {
-
         val now = System.currentTimeMillis()
 
         messageDao.markExpiredQueuedMessages(now)

@@ -1,5 +1,7 @@
-﻿
+
 package com.vanish.classnetwork
+
+import com.vanish.classnetwork.data.relay.RelayProtocolRules
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -20,6 +22,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -39,6 +42,7 @@ import com.vanish.classnetwork.connectivity.rememberInternetConnectivity
 import com.vanish.classnetwork.data.local.DatabaseProvider
 import com.vanish.classnetwork.data.model.Message
 import com.vanish.classnetwork.data.repository.StudentIdentityRepository
+import com.vanish.classnetwork.data.relay.RelayWebSocketClient
 import com.vanish.classnetwork.screens.about.AboutVanishScreen
 import com.vanish.classnetwork.screens.chat.ChatMessage
 import com.vanish.classnetwork.screens.chat.ChatScreen
@@ -65,6 +69,8 @@ private val AppNavy = Color(0xFF071B2C)
 private val AppTeal = Color(0xFF00B596)
 private val AppGrey = Color(0xFF64748B)
 
+private const val RELAY_MESSAGE_LIFETIME = 30_000L
+
 class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -85,30 +91,33 @@ fun VanishApp() {
     val context = LocalContext.current
     val internetAvailable = rememberInternetConnectivity()
 
-    // Student identity repository
     val identityRepository = remember(context) {
         StudentIdentityRepository(context.applicationContext)
     }
 
-    // Room database repository
     val messageRepository = remember(context) {
         DatabaseProvider.getMessageRepository(context.applicationContext)
     }
 
-    // Message ViewModel
     val messageViewModel: MessageViewModel = viewModel(
         factory = remember(messageRepository) {
             MessageViewModelFactory(messageRepository)
         }
     )
 
-    // Observe database messages
     val activeEntities by messageViewModel.activeMessages.collectAsState()
     val queuedEntities by messageViewModel.queuedMessages.collectAsState()
 
     val coroutineScope = rememberCoroutineScope()
 
-    // Observe saved student identity
+    val attemptedQueuedMessageIds = remember {
+        mutableSetOf<String>()
+    }
+
+    var queueRetryRevision by remember {
+        mutableStateOf(0)
+    }
+
     val savedIdentity by identityRepository.studentIdentity.collectAsState(
         initial = null
     )
@@ -119,21 +128,301 @@ fun VanishApp() {
     var classId by remember { mutableStateOf("") }
     var accessCode by remember { mutableStateOf("") }
     var protocolReturnScreen by remember { mutableStateOf("privacy") }
-    var previewConnected by remember { mutableStateOf(false) }
 
-    // Selected message for Message Details
     var selectedMessageId by remember {
         mutableStateOf<String?>(null)
     }
 
-    // Start observing Room messages when a class is selected
-    LaunchedEffect(classId) {
+    // Relay state
+    var relayConnected by remember {
+        mutableStateOf(false)
+    }
+
+    var relayError by remember {
+        mutableStateOf<String?>(null)
+    }
+
+    var relayClockOffset by remember {
+        mutableStateOf(0L)
+    }
+
+    // ---------------------------------------------------------
+    // REAL WEBSOCKET RELAY CONNECTION
+    // ---------------------------------------------------------
+
+    val relayClient = remember {
+
+        RelayWebSocketClient(
+
+            onConnected = { serverTime ->
+
+                coroutineScope.launch {
+
+                    attemptedQueuedMessageIds.clear()
+
+                    relayConnected = true
+                    relayError = null
+
+                    relayClockOffset =
+                        serverTime - System.currentTimeMillis()
+                }
+            },
+
+            onDisconnected = { reason ->
+
+                coroutineScope.launch {
+
+                    attemptedQueuedMessageIds.clear()
+
+                    relayConnected = false
+                    relayError = reason
+                }
+            },
+
+            onMessage = { frame ->
+
+                coroutineScope.launch {
+
+                    try {
+
+                        when (frame.optString("type")) {
+
+                            // ---------------------------------
+                            // MESSAGE RECEIVED OR OUTGOING ECHO
+                            // ---------------------------------
+
+                            "message" -> {
+
+                                val messageId = frame.optString("id")
+                                val sender = frame.optString("sender")
+                                val messageText = frame.optString("text")
+
+                                val serverSentAt =
+                                    frame.optLong("sent_at", 0L)
+
+                                val serverExpiresAt =
+                                    frame.optLong("expires_at", 0L)
+
+                                val validMessage =
+                                    RelayProtocolRules.isValidReceivedMessage(id = messageId, sender = sender, text = messageText, sentAt = serverSentAt, expiresAt = serverExpiresAt) && classId.isNotBlank()
+
+                                if (!validMessage) {
+
+                                    relayError =
+                                        "Invalid relay message frame received."
+
+                                    return@launch
+                                }
+
+                                // Convert relay timestamps to phone time.
+                                val localSentAt =
+                                    RelayProtocolRules.serverTimeToLocal(serverSentAt, relayClockOffset)
+
+                                val localExpiresAt =
+                                    RelayProtocolRules.serverTimeToLocal(serverExpiresAt, relayClockOffset)
+
+                                // Ignore messages that have already expired.
+                                if (
+                                    localExpiresAt >
+                                    System.currentTimeMillis()
+                                ) {
+
+                                    messageViewModel.processRelayMessage(
+                                        messageId = messageId,
+                                        classNetworkId = classId,
+                                        sender = sender,
+
+                                        // The relay protocol does not provide
+                                        // sender device IDs.
+                                        senderDeviceId = "relay-unknown",
+
+                                        text = messageText,
+                                        sentAt = localSentAt,
+                                        expiresAt = localExpiresAt
+                                    )
+                                }
+                            }
+
+                            // ---------------------------------
+                            // DELIVERY ACKNOWLEDGEMENT
+                            // ---------------------------------
+
+                            "delivered" -> {
+
+                                val messageId = frame.optString("id")
+                                val recipientCount =
+                                    frame.optInt("count", -1)
+
+                                if (RelayProtocolRules.isValidDelivered(messageId, recipientCount) && classId.isNotBlank()) {
+
+                                    messageViewModel.processRelayDelivered(
+                                        messageId = messageId,
+                                        classNetworkId = classId,
+
+                                        // The delivered frame has no
+                                        // server_time field.
+                                        serverTime =
+                                            System.currentTimeMillis()
+                                    )
+
+                                } else {
+
+                                    relayError =
+                                        "Invalid delivery acknowledgement received."
+                                }
+                            }
+
+                            // ---------------------------------
+                            // MESSAGE EXPIRY EVENT
+                            // ---------------------------------
+
+                            "expired" -> {
+
+                                val messageId = frame.optString("id")
+
+                                if (RelayProtocolRules.isValidExpired(messageId) && classId.isNotBlank()) {
+
+                                    messageViewModel.processRelayExpired(
+                                        messageId = messageId,
+                                        classNetworkId = classId
+                                    )
+
+                                } else {
+
+                                    relayError =
+                                        "Invalid expiry event received."
+                                }
+                            }
+
+                            else -> {
+                                relayError =
+                                    "Unsupported relay event received."
+                            }
+                        }
+
+                    } catch (exception: Exception) {
+
+                        relayError =
+                            exception.message
+                                ?: "Unable to process relay event."
+                    }
+                }
+            },
+
+            onError = { error ->
+
+                coroutineScope.launch {
+                    relayError = error
+                }
+            }
+        )
+    }
+
+    // ---------------------------------------------------------
+    // CONNECT WHEN CLASS AND IDENTITY ARE AVAILABLE
+    // ---------------------------------------------------------
+
+    LaunchedEffect(classId, savedIdentity) {
+
         if (classId.isNotBlank()) {
             messageViewModel.startObserving(classId)
         }
+
+        val identity = savedIdentity
+
+        if (classId.isNotBlank() && identity != null) {
+
+            try {
+
+                relayClient.disconnect()
+
+                attemptedQueuedMessageIds.clear()
+
+                relayConnected = false
+                relayError = null
+
+                val deviceId =
+                    identityRepository.getOrCreateDeviceId()
+
+                relayClient.connect(
+                    deviceId = deviceId,
+                    displayName = identity.displayName
+                )
+
+            } catch (exception: Exception) {
+
+                relayConnected = false
+
+                relayError =
+                    exception.message ?: "Could not connect to relay."
+            }
+        }
     }
 
-    // Convert active database messages for ChatScreen
+    // ---------------------------------------------------------
+    // AUTOMATIC OFFLINE QUEUE RETRANSMISSION
+    // ---------------------------------------------------------
+
+    LaunchedEffect(
+        relayConnected,
+        classId,
+        queuedEntities,
+        queueRetryRevision
+    ) {
+
+        if (!relayConnected || classId.isBlank()) {
+            return@LaunchedEffect
+        }
+
+        val now = System.currentTimeMillis()
+
+        queuedEntities
+            .filter { entity ->
+
+                entity.isOutgoing &&
+                        entity.status.name == "WAITING" &&
+                        entity.id !in attemptedQueuedMessageIds
+            }
+            .forEach { entity ->
+
+                val expiryTime = entity.expiresAt
+                    ?: (entity.createdAt + RELAY_MESSAGE_LIFETIME)
+
+                if (expiryTime <= now) {
+                    return@forEach
+                }
+
+                attemptedQueuedMessageIds.add(entity.id)
+
+                val accepted = relayClient.sendMessage(
+                    id = entity.id,
+                    sender = entity.sender,
+                    text = entity.text
+                )
+
+                if (!accepted) {
+
+                    relayError =
+                        "A queued message could not be transmitted. Retry when the relay is available."
+                }
+            }
+    }
+
+    // ---------------------------------------------------------
+    // DISCONNECT WHEN COMPOSITION IS REMOVED
+    // ---------------------------------------------------------
+
+    DisposableEffect(relayClient) {
+
+        onDispose {
+            relayClient.disconnect()
+        }
+    }
+
+    // ---------------------------------------------------------
+    // DATABASE MESSAGE CONVERSION
+    // ---------------------------------------------------------
+
     val chatMessages = activeEntities.map { entity ->
 
         val remainingMillis = (
@@ -151,14 +440,13 @@ fun VanishApp() {
         )
     }
 
-    // Convert queued database messages for OfflineQueueScreen
     val databaseQueuedMessages = queuedEntities.map { entity ->
 
         val expiryTime = entity.expiresAt
-            ?: (entity.createdAt + 30_000L)
+            ?: (entity.createdAt + RELAY_MESSAGE_LIFETIME)
 
         val remaining = (
-                (expiryTime - System.currentTimeMillis())
+                expiryTime - System.currentTimeMillis()
                 ).coerceAtLeast(0L) / 1000L
 
         QueuedMessage(
@@ -173,29 +461,29 @@ fun VanishApp() {
         )
     }
 
-    // Find the selected message in Room
     val selectedMessage = activeEntities.firstOrNull {
         it.id == selectedMessageId
     }
 
-    // Restore saved student name
+    // Restore saved student name.
     LaunchedEffect(savedIdentity) {
+
         savedIdentity?.let { identity ->
             studentName = identity.displayName
         }
     }
 
-    // App navigation and Android Back handling
+    // ---------------------------------------------------------
+    // ANDROID BACK HANDLING
+    // ---------------------------------------------------------
+
     BackHandler(enabled = currentScreen != "welcome") {
 
         currentScreen = when (currentScreen) {
 
             "identity" -> "welcome"
-
             "join" -> "identity"
-
             "connection" -> "join"
-
             "chat" -> "connection"
 
             "details" -> {
@@ -208,22 +496,20 @@ fun VanishApp() {
             }
 
             "dashboard" -> "connection"
-
             "queue" -> "connection"
-
             "settings" -> "connection"
-
             "privacy" -> "settings"
-
             "protocol" -> protocolReturnScreen
-
             "about" -> "settings"
-
             "help" -> "connection"
 
             else -> "welcome"
         }
     }
+
+    // ---------------------------------------------------------
+    // SCREEN NAVIGATION
+    // ---------------------------------------------------------
 
     when (currentScreen) {
 
@@ -231,6 +517,7 @@ fun VanishApp() {
         "welcome" -> {
 
             WelcomeScreen(
+
                 onGetStarted = {
                     currentScreen = if (studentName.isNotBlank()) {
                         "join"
@@ -238,6 +525,7 @@ fun VanishApp() {
                         "identity"
                     }
                 },
+
                 onJoinClass = {
                     currentScreen = "join"
                 }
@@ -248,10 +536,13 @@ fun VanishApp() {
         "identity" -> {
 
             StudentRegistrationScreen(
+
                 onContinue = { name ->
 
                     coroutineScope.launch {
+
                         try {
+
                             val identity =
                                 identityRepository.saveIdentity(name)
 
@@ -259,10 +550,12 @@ fun VanishApp() {
                             currentScreen = "join"
 
                         } catch (exception: Exception) {
+
                             exception.printStackTrace()
                         }
                     }
                 },
+
                 onBack = {
                     currentScreen = "welcome"
                 }
@@ -273,52 +566,73 @@ fun VanishApp() {
         "join" -> {
 
             JoinClassScreen(
+
                 studentName = studentName,
+
                 onJoin = { enteredClassId, enteredAccessCode ->
 
                     classId = enteredClassId
                     accessCode = enteredAccessCode
+
                     currentScreen = "connection"
                 },
+
                 onBack = {
                     currentScreen = "identity"
                 }
             )
         }
 
-        // SCREEN 4: Connection Pending
+        // SCREEN 4: Connection
         "connection" -> {
 
             DestinationScreen(
+
                 title = "Connection Pending",
-                description = "Your class details have been entered. Real class verification and relay communication are not connected yet. Explore the chat, message details, connection dashboard, offline queue, settings and help.",
-                buttonText = "Open Chat Preview",
+
+                description = if (relayConnected) {
+                    "Your app has successfully connected to the relay. Open chat to continue."
+                } else {
+                    "Your class details have been entered. The app is attempting to establish a real relay connection."
+                },
+
+                buttonText = "Open Chat",
+
                 onBack = {
                     currentScreen = "join"
                 },
+
                 onContinue = {
-                    previewConnected = false
                     currentScreen = "chat"
                 },
 
                 secondaryButtonText = "Preview Message Details",
+
                 onSecondary = {
                     selectedMessageId = null
                     currentScreen = "details"
                 },
+
                 tertiaryButtonText = "Connection Dashboard",
+
                 onTertiary = {
                     currentScreen = "dashboard"
                 },
+
                 quaternaryButtonText = "Offline Message Queue",
+
                 onQuaternary = {
                     currentScreen = "queue"
                 },
+
                 fifthButtonText = "Settings",
+
                 onFifth = {
                     currentScreen = "settings"
                 },
+
                 sixthButtonText = "Help & Troubleshooting",
+
                 onSixth = {
                     currentScreen = "help"
                 }
@@ -329,9 +643,15 @@ fun VanishApp() {
         "chat" -> {
 
             ChatScreen(
+
                 studentName = studentName,
-                className = classId.ifBlank { "My Class" },
-                isConnected = previewConnected,
+
+                className = classId.ifBlank {
+                    "My Class"
+                },
+
+                isConnected = relayConnected,
+
                 messages = chatMessages,
 
                 onSendMessage = { messageText ->
@@ -339,9 +659,7 @@ fun VanishApp() {
                     if (
                         messageText.isNotBlank() &&
                         classId.isNotBlank()
-                    )
-
-                    {
+                    ) {
 
                         coroutineScope.launch {
 
@@ -352,23 +670,56 @@ fun VanishApp() {
                                 val deviceId =
                                     identityRepository.getOrCreateDeviceId()
 
+                                val trimmedText = messageText.trim()
+
+                                if (trimmedText.length > 500) {
+                                    relayError =
+                                        "Messages cannot exceed 500 characters."
+                                    return@launch
+                                }
+
                                 val newMessage = Message(
                                     sender = studentName,
                                     senderDeviceId = deviceId,
-                                    text = messageText.trim(),
+                                    text = trimmedText,
                                     createdAt = now,
                                     sentAt = null,
-                                    expiresAt = now + 30_000L
+                                    expiresAt =
+                                        now + RELAY_MESSAGE_LIFETIME
                                 )
 
                                 messageViewModel.saveMessage(
                                     message = newMessage,
                                     classNetworkId = classId,
-                                    isOutgoing = true
+                                    isOutgoing = true,
+
+                                    onSaved = {
+
+                                        attemptedQueuedMessageIds.add(
+                                            newMessage.id
+                                        )
+
+                                        val sent = relayClient.sendMessage(
+                                            id = newMessage.id,
+                                            sender = studentName,
+                                            text = trimmedText
+                                        )
+
+                                        relayError = if (sent) {
+                                            null
+                                        } else {
+                                            "Message saved locally, but relay transmission failed."
+                                        }
+                                    }
                                 )
 
                             } catch (exception: Exception) {
+
                                 exception.printStackTrace()
+
+                                relayError =
+                                    exception.message
+                                        ?: "Unable to send message."
                             }
                         }
                     }
@@ -378,7 +729,6 @@ fun VanishApp() {
                     currentScreen = "connection"
                 },
 
-                // Open actual message details
                 onMessageClick = { messageId ->
 
                     selectedMessageId = messageId
@@ -386,8 +736,6 @@ fun VanishApp() {
                 }
             )
         }
-
-        // SCREEN 6: Message Details
 
         // SCREEN 6: Message Details
         "details" -> {
@@ -405,6 +753,7 @@ fun VanishApp() {
                     ((remainingMillis + 999L) / 1000L).toInt()
 
                 MessageDetailsScreen(
+
                     messageId = selectedMessage.id,
                     sender = selectedMessage.sender,
                     messageText = selectedMessage.text,
@@ -434,16 +783,19 @@ fun VanishApp() {
 
             } else if (selectedMessageId != null) {
 
-                // An actual selected message expired or was removed.
-                // Never replace its content with sample message content.
                 MessageDetailsScreen(
+
                     messageId = selectedMessageId!!,
                     sender = "Unavailable",
-                    messageText = "This message has expired or is no longer available.",
+
+                    messageText =
+                        "This message has expired or is no longer available.",
+
                     sentAt = "No longer available",
                     expiresAt = "No longer available",
                     remainingSeconds = 0,
                     deliveryStatus = "EXPIRED / REMOVED",
+
                     onBack = {
                         selectedMessageId = null
                         currentScreen = "chat"
@@ -452,17 +804,22 @@ fun VanishApp() {
 
             } else {
 
-                // Preview is shown only when the user explicitly opens it.
                 MessageDetailsScreen(
+
                     messageId = "preview-message-001",
+
                     sender = studentName.ifBlank {
                         "Sample Student"
                     },
-                    messageText = "This is a sample message to demonstrate the Message Details screen.",
+
+                    messageText =
+                        "This is a sample message to demonstrate the Message Details screen.",
+
                     sentAt = "Preview only",
                     expiresAt = "Not calculated",
                     remainingSeconds = 30,
                     deliveryStatus = "Local preview",
+
                     onBack = {
                         selectedMessageId = null
                         currentScreen = "connection"
@@ -475,14 +832,32 @@ fun VanishApp() {
         "dashboard" -> {
 
             ConnectionDashboardScreen(
+
                 studentName = studentName,
                 classNetworkId = classId,
-                connectionStatus = if (internetAvailable) "Internet available (relay not connected)" else "No internet",
-                relayStatus = "Not configured",
-                lastHeartbeat = "Not available",
-                onRefresh = {
-                    // Real network refresh will be implemented later.
+
+                connectionStatus = when {
+                    relayConnected -> "Connected to relay"
+                    !internetAvailable -> "No internet connection"
+                    else -> "Connecting to relay"
                 },
+
+                relayStatus = when {
+                    relayConnected -> "Connected"
+                    relayError != null -> "Connection error: $relayError"
+                    else -> "Connecting / Disconnected"
+                },
+
+                lastHeartbeat = if (relayConnected) {
+                    "Heartbeat active"
+                } else {
+                    "Not available"
+                },
+
+                onRefresh = {
+                    // Manual relay refresh remains pending.
+                },
+
                 onBack = {
                     currentScreen = "connection"
                 }
@@ -493,14 +868,28 @@ fun VanishApp() {
         "queue" -> {
 
             OfflineQueueScreen(
-                isOnline = false,
+
+                isOnline = relayConnected,
                 queuedMessages = databaseQueuedMessages,
+
                 onRetry = {
-                    // Real retry logic requires relay connectivity.
+
+                    if (relayConnected) {
+
+                        attemptedQueuedMessageIds.clear()
+                        queueRetryRevision++
+
+                    } else {
+
+                        relayError =
+                            "Waiting for relay connection."
+                    }
                 },
+
                 onRemoveExpired = {
                     messageViewModel.removeExpiredMessages()
                 },
+
                 onBack = {
                     currentScreen = "connection"
                 }
@@ -511,12 +900,15 @@ fun VanishApp() {
         "settings" -> {
 
             SettingsScreen(
+
                 onBack = {
                     currentScreen = "connection"
                 },
+
                 onPrivacy = {
                     currentScreen = "privacy"
                 },
+
                 onAbout = {
                     currentScreen = "about"
                 }
@@ -527,9 +919,11 @@ fun VanishApp() {
         "privacy" -> {
 
             PrivacySecurityScreen(
+
                 onBack = {
                     currentScreen = "settings"
                 },
+
                 onProtocol = {
                     protocolReturnScreen = "privacy"
                     currentScreen = "protocol"
@@ -541,6 +935,7 @@ fun VanishApp() {
         "protocol" -> {
 
             ProtocolInfoScreen(
+
                 onBack = {
                     currentScreen = protocolReturnScreen
                 }
@@ -551,6 +946,7 @@ fun VanishApp() {
         "about" -> {
 
             AboutVanishScreen(
+
                 onBack = {
                     currentScreen = "settings"
                 }
@@ -561,9 +957,11 @@ fun VanishApp() {
         "help" -> {
 
             HelpTroubleshootingScreen(
+
                 onBack = {
                     currentScreen = "connection"
                 },
+
                 onProtocol = {
                     protocolReturnScreen = "help"
                     currentScreen = "protocol"
@@ -572,6 +970,10 @@ fun VanishApp() {
         }
     }
 }
+
+// -------------------------------------------------------------
+// DESTINATION / NAVIGATION SCREEN
+// -------------------------------------------------------------
 
 @Composable
 fun DestinationScreen(
@@ -601,7 +1003,9 @@ fun DestinationScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(26.dp),
+
             horizontalAlignment = Alignment.CenterHorizontally,
+
             verticalArrangement = Arrangement.Center
         ) {
 
@@ -623,8 +1027,8 @@ fun DestinationScreen(
 
             Spacer(modifier = Modifier.height(30.dp))
 
-            // 1. Open Chat Preview
             Button(
+
                 onClick = {
                     if (onContinue != null) {
                         onContinue()
@@ -632,15 +1036,20 @@ fun DestinationScreen(
                         onBack()
                     }
                 },
+
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(55.dp),
+
                 shape = RoundedCornerShape(15.dp),
+
                 colors = ButtonDefaults.buttonColors(
                     containerColor = Color(0xFF0B1726),
                     contentColor = Color.White
                 )
+
             ) {
+
                 Text(
                     text = buttonText,
                     fontWeight = FontWeight.Bold,
@@ -648,22 +1057,25 @@ fun DestinationScreen(
                 )
             }
 
-            // 2. Preview Message Details
             if (secondaryButtonText != null && onSecondary != null) {
 
                 Spacer(modifier = Modifier.height(10.dp))
 
                 Button(
                     onClick = onSecondary,
+
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(55.dp),
+
                     shape = RoundedCornerShape(15.dp),
+
                     colors = ButtonDefaults.buttonColors(
                         containerColor = AppTeal,
                         contentColor = Color.White
                     )
                 ) {
+
                     Text(
                         text = secondaryButtonText,
                         fontWeight = FontWeight.Bold
@@ -671,22 +1083,25 @@ fun DestinationScreen(
                 }
             }
 
-            // 3. Connection Dashboard
             if (tertiaryButtonText != null && onTertiary != null) {
 
                 Spacer(modifier = Modifier.height(10.dp))
 
                 Button(
                     onClick = onTertiary,
+
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(55.dp),
+
                     shape = RoundedCornerShape(15.dp),
+
                     colors = ButtonDefaults.buttonColors(
                         containerColor = Color(0xFFEBF7F5),
                         contentColor = AppNavy
                     )
                 ) {
+
                     Text(
                         text = tertiaryButtonText,
                         fontWeight = FontWeight.Bold
@@ -694,22 +1109,25 @@ fun DestinationScreen(
                 }
             }
 
-            // 4. Offline Message Queue
             if (quaternaryButtonText != null && onQuaternary != null) {
 
                 Spacer(modifier = Modifier.height(10.dp))
 
                 Button(
                     onClick = onQuaternary,
+
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(55.dp),
+
                     shape = RoundedCornerShape(15.dp),
+
                     colors = ButtonDefaults.buttonColors(
                         containerColor = Color(0xFF475569),
                         contentColor = Color.White
                     )
                 ) {
+
                     Text(
                         text = quaternaryButtonText,
                         fontWeight = FontWeight.Bold
@@ -717,22 +1135,25 @@ fun DestinationScreen(
                 }
             }
 
-            // 5. Settings
             if (fifthButtonText != null && onFifth != null) {
 
                 Spacer(modifier = Modifier.height(10.dp))
 
                 Button(
                     onClick = onFifth,
+
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(55.dp),
+
                     shape = RoundedCornerShape(15.dp),
+
                     colors = ButtonDefaults.buttonColors(
                         containerColor = Color(0xFFEDE7F6),
                         contentColor = AppNavy
                     )
                 ) {
+
                     Text(
                         text = fifthButtonText,
                         fontWeight = FontWeight.Bold
@@ -740,22 +1161,25 @@ fun DestinationScreen(
                 }
             }
 
-            // 6. Help & Troubleshooting
             if (sixthButtonText != null && onSixth != null) {
 
                 Spacer(modifier = Modifier.height(10.dp))
 
                 Button(
                     onClick = onSixth,
+
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(55.dp),
+
                     shape = RoundedCornerShape(15.dp),
+
                     colors = ButtonDefaults.buttonColors(
                         containerColor = Color(0xFFEFF2F7),
                         contentColor = AppNavy
                     )
                 ) {
+
                     Text(
                         text = sixthButtonText,
                         fontWeight = FontWeight.Bold
@@ -768,6 +1192,7 @@ fun DestinationScreen(
                 Spacer(modifier = Modifier.height(8.dp))
 
                 TextButton(onClick = onBack) {
+
                     Text(
                         text = "Back",
                         color = AppNavy,
@@ -778,4 +1203,6 @@ fun DestinationScreen(
         }
     }
 }
+
+
 

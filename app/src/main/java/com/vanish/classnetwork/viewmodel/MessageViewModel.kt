@@ -41,6 +41,7 @@ class MessageViewModel(
     private var queuedMessagesJob: Job? = null
     private var cleanupJob: Job? = null
 
+    // Observe active messages, queued messages and expiry cleanup.
     fun startObserving(classNetworkId: String) {
 
         if (classNetworkId.isBlank()) {
@@ -80,10 +81,12 @@ class MessageViewModel(
         }
     }
 
+    // Save a locally created message.
     fun saveMessage(
         message: Message,
         classNetworkId: String,
-        isOutgoing: Boolean
+        isOutgoing: Boolean,
+        onSaved: (() -> Unit)? = null
     ) {
         viewModelScope.launch {
             _isLoading.value = true
@@ -95,6 +98,10 @@ class MessageViewModel(
                     classNetworkId = classNetworkId,
                     isOutgoing = isOutgoing
                 )
+
+                // Called only after the database save succeeds.
+                onSaved?.invoke()
+
             } catch (exception: Exception) {
                 _errorMessage.value =
                     exception.message ?: "Unable to save message."
@@ -104,6 +111,7 @@ class MessageViewModel(
         }
     }
 
+    // Update a message status when permitted by the repository.
     fun updateMessageStatus(
         messageId: String,
         classNetworkId: String,
@@ -123,6 +131,7 @@ class MessageViewModel(
         }
     }
 
+    // Delete a specific message.
     fun deleteMessage(
         messageId: String,
         classNetworkId: String
@@ -140,11 +149,73 @@ class MessageViewModel(
         }
     }
 
-
-    fun clearError() {
-        _errorMessage.value = null
+    // Process a message received from the relay.
+    fun processRelayMessage(
+        messageId: String,
+        classNetworkId: String,
+        sender: String,
+        senderDeviceId: String,
+        text: String,
+        sentAt: Long,
+        expiresAt: Long
+    ) {
+        viewModelScope.launch {
+            try {
+                repository.saveRelayMessage(
+                    messageId = messageId,
+                    classNetworkId = classNetworkId,
+                    sender = sender,
+                    senderDeviceId = senderDeviceId,
+                    text = text,
+                    sentAt = sentAt,
+                    expiresAt = expiresAt
+                )
+            } catch (exception: Exception) {
+                _errorMessage.value =
+                    exception.message ?: "Unable to process received message."
+            }
+        }
     }
 
+    // Process a delivery acknowledgement from the relay.
+    fun processRelayDelivered(
+        messageId: String,
+        classNetworkId: String,
+        serverTime: Long
+    ) {
+        viewModelScope.launch {
+            try {
+                repository.markRelayMessageDelivered(
+                    messageId = messageId,
+                    classNetworkId = classNetworkId,
+                    serverTime = serverTime
+                )
+            } catch (exception: Exception) {
+                _errorMessage.value =
+                    exception.message ?: "Unable to update delivery confirmation."
+            }
+        }
+    }
+
+    // Process a relay expiry event.
+    fun processRelayExpired(
+        messageId: String,
+        classNetworkId: String
+    ) {
+        viewModelScope.launch {
+            try {
+                repository.removeRelayExpiredMessage(
+                    messageId = messageId,
+                    classNetworkId = classNetworkId
+                )
+            } catch (exception: Exception) {
+                _errorMessage.value =
+                    exception.message ?: "Unable to process message expiry."
+            }
+        }
+    }
+
+    // Run message cleanup when requested by the UI.
     fun removeExpiredMessages() {
         viewModelScope.launch {
             try {
@@ -154,6 +225,11 @@ class MessageViewModel(
                     exception.message ?: "Unable to remove expired messages."
             }
         }
+    }
+
+    // Clear the displayed error.
+    fun clearError() {
+        _errorMessage.value = null
     }
 
     override fun onCleared() {
